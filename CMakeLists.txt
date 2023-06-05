@@ -14,6 +14,15 @@ message("OpenCV LIBS DIRS: " ${OpenCV_LIBS})
 include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(/usr/local/cuda/include)
 
+add_library(yolo_plugins
+    SHARED
+    src/plugins/yoloPlugins.cpp
+    src/plugins/yoloForward_nc.cu
+)
+target_include_directories(yolo_plugins PUBLIC ${TensorRT_INCLUDE_DIRS})
+target_link_libraries(yolo_plugins PUBLIC ${TensorRT_LIBRARIES})
+set_target_properties(yolo_plugins PROPERTIES CUDA_ARCHITECTURES "61;70;75")
+
 add_library(process
     SHARED
     src/process/postprocess.cpp
@@ -30,7 +39,8 @@ add_executable(build
     ${TensorRT_SAMPLE_DIR}/common/sampleUtils.cpp
 )
 target_include_directories(build PRIVATE ${TensorRT_INCLUDE_DIR} ${TensorRT_SAMPLE_DIR}/common)
-target_link_libraries(build PRIVATE ${TensorRT_LIBRARIES})
+target_link_libraries(build PRIVATE -Wl,--no-as-needed yolo_plugins) # -Wl,--no-as-needed is needed to avoid linking errors
+target_link_libraries(build PRIVATE process)
 
 add_executable(runtime
     src/runtime.cu
@@ -43,3 +53,6 @@ target_include_directories(runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/src/process
 )
 target_link_libraries(runtime PRIVATE ${TensorRT_LIBRARIES})
+target_link_libraries(runtime PRIVATE process)
+target_link_libraries(runtime PRIVATE -Wl,--no-as-needed yolo_plugins)
+set_target_properties(runtime PROPERTIES CUDA_ARCHITECTURES "61;70;75")

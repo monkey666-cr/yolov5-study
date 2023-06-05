@@ -7,3 +7,8 @@ build
 # 模型文件
 *.onnx
 *.engine
+*.pt
+
+*.mp4
+*.jpg
+*.png
