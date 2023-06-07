@@ -27,15 +27,16 @@ std::vector<unsigned char> load_engine_file(const std::string &file_name)
 int main(int argc, char **argv)
 {
     /* code */
-    if (argc < 3)
+    if (argc < 4)
     {
-        std::cerr << "用法: " << argv[0] << "<engine_file> <input_path_file>" << std::endl;
+        std::cerr << "用法: " << argv[0] << "<engine_file> <input_path_file> <mode>" << std::endl;
 
         return -1;
     }
 
     auto engine_file = argv[1];
     auto input_video_path = argv[2];
+    auto mode = std::stoi(argv[3]);
 
     // ====== 1. 创建推理运行时 runtime ======
     auto runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(sample::gLogger.getTRTLogger()));
@@ -96,8 +97,22 @@ int main(int argc, char **argv)
             break;
         }
         frame_index++;
-        // 输入预处理
-        process_input(frame, (float *)buffers.getDeviceBuffer(kInputTensorName));
+
+        // 选择处理方式
+        if (mode == 0)
+        {
+            // 使用CPU做letterbox, 归一化, BGR2RGB、NHWC to NCHW
+            process_input_cpu(frame, (float *)buffers.getDeviceBuffer(kInputTensorName));
+        }
+        else if (mode == 1)
+        {
+            process_input_cv_affine(frame, (float *)buffers.getDeviceBuffer(kInputTensorName));
+        }
+        else if (mode == 2)
+        {
+            // 输入预处理
+            process_input_gpu(frame, (float *)buffers.getDeviceBuffer(kInputTensorName));
+        }
 
         // ====== 5. 执行推理 ======
         context->executeV2(buffers.getDeviceBindings().data());

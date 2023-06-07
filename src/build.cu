@@ -5,17 +5,125 @@
 #include "buffers.h"
 #include "cassert"
 
+#include "process/config.h"
+#include "process/preprocess.h"
+
+// 定义校准数据读取器
+// 如果要用entropy的话改为：IInt8EntropyCalibrator2
+class CalibrationDataReader : public nvinfer1::IInt8MinMaxCalibrator
+{
+private:
+    std::string mDataDir;
+    std::string mCacheFileName;
+    std::vector<std::string> mFileNames;
+    int mBatchSize;
+    nvinfer1::Dims mInputDims;
+    int mInputCount;
+    float *mDeviceBatchData{nullptr};
+    int mBatchCount;
+    int mImgSize;
+    int mCurBatch{0};
+    std::vector<char> mCalibrationCache;
+
+public:
+    // 构造函数，初始化参数
+    CalibrationDataReader(const std::string &dataDir, const std::string &list, int batchSize = 1)
+        : mDataDir(dataDir), mCacheFileName("weights/calibration.cache"), mBatchSize(batchSize), mImgSize(kInputH * kInputW)
+    {
+        mInputDims = {1, 3, kInputH, kInputW}; // 设置网络输入尺寸
+        mInputCount = mBatchSize * samplesCommon::volume(mInputDims);
+        cuda_preprocess_init(mImgSize);                                       // 初始化预处理内存
+        cudaMalloc(&mDeviceBatchData, kInputH * kInputW * 3 * sizeof(float)); // 分配预处理内存
+        // 加载校准数据集文件列表
+        std::ifstream infile(list);
+        std::string line;
+        while (std::getline(infile, line))
+        {
+            sample::gLogInfo << line << std::endl;
+            mFileNames.push_back(line);
+        }
+        mBatchCount = mFileNames.size() / mBatchSize;
+        std::cout << "CalibrationDataReader: " << mFileNames.size() << " images, " << mBatchCount << " batches." << std::endl;
+    }
+
+    int32_t getBatchSize() const noexcept override
+    {
+        return mBatchSize;
+    }
+
+    // 用于提供一批校准数据。在该方法中，需要将当前批次的校准数据读取到内存中，并将其复制到设备内存中。然后，将数据指针传递给 TensorRT 引擎，以供后续的校准计算使用。
+    bool getBatch(void *bindings[], const char *names[], int nbBindings) noexcept override
+    {
+        if (mCurBatch + 1 > mBatchCount)
+        {
+            return false;
+        }
+        int offset = kInputW * kInputH * 3 * sizeof(float);
+        for (int i = 0; i < mBatchSize; i++)
+        {
+            int idx = mCurBatch * mBatchSize + i;
+            std::string fileName = mDataDir + "/" + mFileNames[idx];
+            cv::Mat img = cv::imread(fileName);
+            int new_img_size = img.cols * img.rows;
+            if (new_img_size > mImgSize)
+            {
+                mImgSize = new_img_size;
+                cuda_preprocess_destroy();      // 释放之前的内存
+                cuda_preprocess_init(mImgSize); // 重新分配内存
+            }
+            // 预处理，并将预处理后的数据复制到设备内存中
+            process_input_gpu(img, mDeviceBatchData + i * offset);
+        }
+        for (int i = 0; i < nbBindings; i++)
+        {
+            if (!strcmp(names[i], kInputTensorName))
+            {
+                bindings[i] = mDeviceBatchData + i * offset;
+            }
+        }
+
+        mCurBatch++;
+        return true;
+    }
+
+    // 从缓存文件中读取校准缓存，返回一个指向缓存数据的指针，以及缓存数据的大小。如果没有缓存数据，则返回`nullptr`。
+    const void *readCalibrationCache(std::size_t &length) noexcept override
+    {
+        mCalibrationCache.clear();
+
+        std::ifstream input(mCacheFileName, std::ios::binary);
+        input >> std::noskipws;
+
+        if (input.good())
+        {
+            std::copy(std::istream_iterator<char>(input), std::istream_iterator<char>(),
+                      std::back_inserter(mCalibrationCache));
+        }
+
+        length = mCalibrationCache.size();
+
+        return length ? mCalibrationCache.data() : nullptr;
+    }
+    // 用于将校准缓存写入到缓存文件中。在该方法中，需要将缓存数据指针和缓存数据的大小传递给文件输出流，并将其写入到缓存文件中。
+    void writeCalibrationCache(const void *cache, std::size_t length) noexcept override
+    {
+        std::ofstream output(mCacheFileName, std::ios::binary);
+        output.write(reinterpret_cast<const char *>(cache), length);
+    }
+};
+
 int main(int argc, char **argv)
 {
-    if (argc != 2)
+    if (argc != 4)
     {
-        std::cerr << "用法: ./build [onnx_file_path]" << std::endl;
+        std::cerr << "用法: ./build [onnx_file_path] [calib_dir] [calib_list_file]" << std::endl;
         return -1;
     }
+
     // 命令行中的onnx文件路径
     char *onnx_file_path = argv[1];
-
-    std::cout << "onnx file path: " << onnx_file_path << std::endl;
+    char *calib_dir = argv[2];
+    char *calib_list_filt = argv[3];
 
     // ====== 1. 创建 builder ======
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(sample::gLogger.getTRTLogger()));
@@ -67,11 +175,23 @@ int main(int argc, char **argv)
     }
     // 使用 addOptimizationProfile 方法添加 profile, 用于输入的动态尺寸
     config->addOptimizationProfile(profile);
+
     // 设置精度, 不设置是FP32, 设置位FP16, 设置位INT8需要额外设置calibrator
-    config->setFlag(nvinfer1::BuilderFlag::kFP16);
+    if (!builder->platformHasFastInt8())
+    {
+        sample::gLogInfo << "设备不支持int8." << std::endl;
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+    }
+    else
+    {
+        auto calibrator = new CalibrationDataReader(calib_dir, calib_list_filt);
+        config->setFlag(nvinfer1::BuilderFlag::kINT8);
+        config->setInt8Calibrator(calibrator);
+    }
+
     // 设置最大batchsize
     builder->setMaxBatchSize(1);
-    // 设置最大工作空间axBatchSize(int32_t)’ is deprecated 
+    // 设置最大工作空间axBatchSize(int32_t)’ is deprecated
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1 << 30);
 
     // 创建流, 用于设置 profile

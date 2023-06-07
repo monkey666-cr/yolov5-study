@@ -8,7 +8,9 @@ build
 *.onnx
 *.engine
 *.pt
+*.cache
 
 *.mp4
 *.jpg
 *.png
+filelist.txt
